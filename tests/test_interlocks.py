@@ -177,6 +177,58 @@ def test_shutdown_stops_every_section_in_the_permitted_order(tmp_path: Path) -> 
     assert runtime.control.balance.is_stopped() is True
 
 
+def test_dwell_evaluation_rejects_a_superseded_baseline(tmp_path: Path) -> None:
+    runtime = manual_runtime(tmp_path)
+    baseline = runtime.control.confirm_flow_baseline(reason="test")
+    runtime.control.recalibrate_flow(1.1, reason="recalibration")
+    with pytest.raises(StaleWarrantyError) as failure:
+        runtime.control.evaluate_dwell(baseline_id=baseline["baseline_id"], raw_lph=12000.0, reason="test")
+    assert failure.value.details["state"] == "superseded"
+    assert runtime.control.hold.bypass_active() is False
+
+
+def test_dwell_evaluation_rejects_an_elapsed_baseline(tmp_path: Path) -> None:
+    runtime = manual_runtime(tmp_path)
+    baseline = runtime.control.confirm_flow_baseline(reason="test")
+    runtime.control.advance_time(
+        runtime.config.evidence.baseline_ttl_seconds + 1.0
+    )
+    with pytest.raises(StaleWarrantyError) as failure:
+        runtime.control.evaluate_dwell(baseline_id=baseline["baseline_id"], raw_lph=12000.0, reason="test")
+    assert failure.value.details["state"] == "elapsed"
+
+
+def test_dwell_follows_the_recalibrated_baseline_and_locks_the_bypass(tmp_path: Path) -> None:
+    runtime = manual_runtime(tmp_path)
+    runtime.control.recalibrate_flow(1.1, reason="recalibration")
+    baseline = runtime.control.confirm_flow_baseline(reason="test")
+    assert baseline["payload"]["gain"] == 1.1
+    outcome = runtime.control.evaluate_dwell(
+        baseline_id=baseline["baseline_id"],
+        raw_lph=12000.0,
+        reason="test",
+    )
+    assert outcome["corrected_lph"] == 13200.0
+    assert outcome["dwell_seconds"] == pytest.approx(5.4545, abs=0.001)
+    assert outcome["verdict"] == "short"
+    assert runtime.control.hold.bypass_active() is True
+
+
+def test_bypass_recovery_still_holds_when_the_dwell_remains_short(tmp_path: Path) -> None:
+    runtime = manual_runtime(tmp_path)
+    baseline = runtime.control.confirm_flow_baseline(reason="test")
+    runtime.control.evaluate_dwell(baseline_id=baseline["baseline_id"], raw_lph=17500.0, reason="test")
+    # Temperature is back inside the window, but throughput still gives a short dwell.
+    with pytest.raises(LatchActiveError):
+        runtime.control.recover_hold(
+            137.0,
+            baseline_id=baseline["baseline_id"],
+            raw_lph=17500.0,
+            reason="operator",
+        )
+    assert runtime.control.hold.bypass_active() is True
+
+
 def test_hold_bypass_latch_stays_set_until_temperature_and_dwell_recover(tmp_path: Path) -> None:
     runtime = manual_runtime(tmp_path)
     baseline = runtime.control.confirm_flow_baseline(reason="test")

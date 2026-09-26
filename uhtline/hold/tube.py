@@ -13,6 +13,7 @@ from ..stages import latches as latch_names
 from ..stages.latches import LatchBoard
 from ..versioning.warranties import Baseline, WarrantyBook
 
+FLOW_SCOPE = "flow-calibration"
 HOLD_VOLUME_LITRES = 20.0
 
 
@@ -53,6 +54,28 @@ class HoldTube:
             raise RangeError("flow must be positive to derive dwell", field="litres_per_hour", value=float(litres_per_hour))
         return round(HOLD_VOLUME_LITRES / (float(litres_per_hour) / 3600.0), 4)
 
+    def _require_baseline(self, baseline_id: str) -> Baseline:
+        """Reject a baseline that has expired or belongs to a superseded generation."""
+
+        return self.warranties.require_baseline(baseline_id, scope=FLOW_SCOPE)
+
+    def _corrected_flow(self, baseline: Baseline, raw_lph: float) -> float:
+        """Apply the accepted baseline gain to the current measured throughput."""
+
+        gain = float(baseline.payload["gain"])
+        return round(float(raw_lph) * gain, 4)
+
+    def _verdict(self, corrected_lph: float) -> tuple[str, float]:
+        flow_envelope = self.config.flow
+        dwell = self.dwell_seconds(corrected_lph)
+        if not flow_envelope.minimum_litres_per_hour <= corrected_lph <= flow_envelope.maximum_litres_per_hour:
+            return "flow-out-of-range", dwell
+        if dwell < self.config.temperature.hold_minimum_seconds:
+            return "short", dwell
+        if dwell > self.config.temperature.hold_maximum_seconds:
+            return "long", dwell
+        return "pass", dwell
+
     def evaluate(
         self,
         *,
@@ -60,22 +83,17 @@ class HoldTube:
         raw_lph: float,
         reason: str,
     ) -> dict[str, Any]:
-        """Reject a baseline that belongs to a superseded flow generation."""
-
-        baseline: Baseline = self.warranties.baseline_record(baseline_id)
+        baseline = self._require_baseline(baseline_id)
         gain = float(baseline.payload["gain"])
-        corrected = round(float(self.config.flow.nominal_litres_per_hour) * gain, 4)
-        envelope = self.config.temperature
-        flow_envelope = self.config.flow
-        dwell = self.dwell_seconds(corrected)
-        if not flow_envelope.minimum_litres_per_hour <= corrected <= flow_envelope.maximum_litres_per_hour:
-            verdict = "flow-out-of-range"
-        elif dwell < envelope.hold_minimum_seconds:
-            verdict = "short"
-        elif dwell > envelope.hold_maximum_seconds:
-            verdict = "long"
-        else:
-            verdict = "pass"
+        corrected = self._corrected_flow(baseline, raw_lph)
+        verdict, dwell = self._verdict(corrected)
+        if verdict != "pass":
+            # Insufficient holding is a sterile-boundary event: lock the bypass first.
+            self.latches.set(
+                latch_names.HOLD_BYPASS,
+                reason=f"dwell {verdict}",
+                detail=f"{verdict} at {dwell:g} s",
+            )
         entry = {
             "action": "dwell",
             "baseline_id": baseline.baseline_id,
@@ -103,18 +121,24 @@ class HoldTube:
     ) -> dict[str, Any]:
         """Clear the bypass latch only when temperature and dwell both recover."""
 
+        baseline = self._require_baseline(baseline_id)
+        corrected = self._corrected_flow(baseline, raw_lph)
+        verdict, dwell = self._verdict(corrected)
+        dwell_pass = verdict == "pass"
         in_spec = self.config.temperature.sterilization_in_spec(float(value_c))
-        satisfied = bool(in_spec)
+        satisfied = bool(in_spec) and dwell_pass
         latch = self.latches.clear(
             latch_names.HOLD_BYPASS,
             reason=reason,
             satisfied=satisfied,
-            detail=f"temperature_in_spec={in_spec}",
+            detail=(
+                f"temperature_in_spec={in_spec}, dwell_verdict={verdict}, dwell_seconds={dwell:g}"
+            ),
         )
         self.audit.record("hold-recover", "hold", f"cleared={not latch.active}", cause=None)
         return {
             "latch": latch.as_dict(),
-            "dwell": {"verdict": "pass" if in_spec else "hold"},
+            "dwell": {"verdict": "pass" if satisfied else "hold", "dwell_seconds": dwell},
             "temperature_in_spec": in_spec,
             "cleared": not latch.active,
         }

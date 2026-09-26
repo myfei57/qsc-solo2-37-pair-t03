@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+from uhtline.app.runtime import build_runtime
+from uhtline.core.clock import ManualClock
 from uhtline.errors import NotFoundError, StaleGenerationError, ValidationError
 
 from .support import STERILE_SENSOR, manual_runtime
@@ -110,6 +112,19 @@ def test_flow_calibration_history_records_every_change(tmp_path: Path) -> None:
     assert [item["gain"] for item in history] == [1.05, 1.08]
     assert history[-1]["offset"] == 0.5
     assert runtime.flowmeter.gain == 1.08
+
+
+def test_a_confirmed_baseline_carries_the_currently_effective_gain(tmp_path: Path) -> None:
+    runtime = manual_runtime(tmp_path)
+    runtime.control.recalibrate_flow(1.12, 0.25, reason="recalibration")
+    baseline = runtime.control.confirm_flow_baseline(reason="test")
+    assert baseline["payload"]["gain"] == 1.12
+    assert baseline["payload"]["offset"] == 0.25
+    # The standing instrument and its durable document must agree with the baseline.
+    assert runtime.flowmeter.gain == 1.12
+    reloaded = build_runtime(runtime.config, runtime.store.root, ManualClock())
+    assert reloaded.flowmeter.gain == 1.12
+
 
 
 def test_temperature_history_records_every_reading(tmp_path: Path) -> None:
