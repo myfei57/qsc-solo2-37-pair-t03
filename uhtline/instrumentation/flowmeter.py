@@ -95,6 +95,8 @@ class FlowMeter:
             {**self.config.flow.__dict__, "gain": float(gain), "offset": float(offset)},
             reason=reason,
         )
+        self._gain = float(gain)
+        self._offset = float(offset)
         self._calibrations.append(
             {
                 "generation": revision.generation,
@@ -125,7 +127,9 @@ class FlowMeter:
 
     def record(self, raw_lph: float) -> Reading:
         reading = self.measure(raw_lph)
-        return self._series.append(float(raw_lph), unit="L/h", generation=reading.generation)
+        return self._series.append(
+            reading.litres_per_hour, unit="L/h", generation=reading.generation
+        )
 
     def series(self) -> ReadingSeries:
         return self._series

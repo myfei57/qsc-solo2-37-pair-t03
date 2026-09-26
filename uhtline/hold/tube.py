@@ -60,11 +60,13 @@ class HoldTube:
         raw_lph: float,
         reason: str,
     ) -> dict[str, Any]:
-        """Reject a baseline that belongs to a superseded flow generation."""
+        """Reject a stale baseline, derive dwell from the live flow and latch on loss."""
 
-        baseline: Baseline = self.warranties.baseline_record(baseline_id)
+        if float(raw_lph) <= 0:
+            raise RangeError("flow must be positive to derive dwell", field="raw_lph", value=float(raw_lph))
+        baseline: Baseline = self.warranties.require_baseline(baseline_id, scope="flow-calibration")
         gain = float(baseline.payload["gain"])
-        corrected = round(float(self.config.flow.nominal_litres_per_hour) * gain, 4)
+        corrected = round(float(raw_lph) * gain, 4)
         envelope = self.config.temperature
         flow_envelope = self.config.flow
         dwell = self.dwell_seconds(corrected)
@@ -76,6 +78,12 @@ class HoldTube:
             verdict = "long"
         else:
             verdict = "pass"
+        if verdict != "pass":
+            self.latches.set(
+                latch_names.HOLD_BYPASS,
+                reason=reason,
+                detail=f"{verdict}: dwell={dwell:g}s corrected_lph={corrected:g}",
+            )
         entry = {
             "action": "dwell",
             "baseline_id": baseline.baseline_id,
@@ -85,6 +93,7 @@ class HoldTube:
             "corrected_lph": corrected,
             "dwell_seconds": dwell,
             "verdict": verdict,
+            "bypass_latched": verdict != "pass",
             "reason": str(reason),
             "timestamp": self.clock.timestamp(),
         }
@@ -104,18 +113,34 @@ class HoldTube:
         """Clear the bypass latch only when temperature and dwell both recover."""
 
         in_spec = self.config.temperature.sterilization_in_spec(float(value_c))
-        satisfied = bool(in_spec)
+        baseline: Baseline = self.warranties.require_baseline(baseline_id, scope="flow-calibration")
+        gain = float(baseline.payload["gain"])
+        corrected = round(float(raw_lph) * gain, 4)
+        flow_envelope = self.config.flow
+        dwell = self.dwell_seconds(corrected)
+        dwell_ok = (
+            flow_envelope.minimum_litres_per_hour <= corrected <= flow_envelope.maximum_litres_per_hour
+            and self.config.temperature.hold_minimum_seconds
+            <= dwell
+            <= self.config.temperature.hold_maximum_seconds
+        )
+        satisfied = bool(in_spec) and dwell_ok
         latch = self.latches.clear(
             latch_names.HOLD_BYPASS,
             reason=reason,
             satisfied=satisfied,
-            detail=f"temperature_in_spec={in_spec}",
+            detail=f"temperature_in_spec={in_spec}; dwell_ok={dwell_ok} ({dwell:g}s at {corrected:g} L/h)",
         )
         self.audit.record("hold-recover", "hold", f"cleared={not latch.active}", cause=None)
         return {
             "latch": latch.as_dict(),
-            "dwell": {"verdict": "pass" if in_spec else "hold"},
+            "dwell": {
+                "verdict": "pass" if dwell_ok else "hold",
+                "dwell_seconds": dwell,
+                "corrected_lph": corrected,
+            },
             "temperature_in_spec": in_spec,
+            "dwell_ok": dwell_ok,
             "cleared": not latch.active,
         }
 
